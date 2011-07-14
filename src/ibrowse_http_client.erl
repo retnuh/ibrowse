@@ -634,8 +634,8 @@ send_req_1(From,
                              proxy_auth_digest = Digest}}
         end,
     State_2 = check_ssl_options(Options, State_1),
-    do_trace("Connecting...~n", []),
     Conn_timeout = get_value(connect_timeout, Options, Timeout),
+    do_trace("Connecting: ~p ~p ~p ~p ~p~n", [Host_1, Port_1, Options, State_2, Conn_timeout]),
     case do_connect(Host_1, Port_1, Options, State_2, Conn_timeout) of
         {ok, Sock} ->
             do_trace("Connected! Socket: ~1000.p~n", [Sock]),
