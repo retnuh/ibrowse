@@ -23,7 +23,11 @@
          test_20122010/1,
          test_pipeline_head_timeout/0,
          test_pipeline_head_timeout/1,
-         do_test_pipeline_head_timeout/4
+         do_test_pipeline_head_timeout/4,
+         test_head_transfer_encoding/0,
+         test_head_transfer_encoding/1,
+         test_head_response_with_body/0,
+         test_head_response_with_body/1
 	]).
 
 test_stream_once(Url, Method, Options) ->
@@ -84,7 +88,7 @@ send_reqs_1(Url, NumWorkers, NumReqsPerWorker) ->
     log_msg("Starting spawning of workers...~n", []),
     spawn_workers(Url, NumWorkers, NumReqsPerWorker),
     log_msg("Finished spawning workers...~n", []),
-    do_wait(),
+    do_wait(Url),
     End_time = now(),
     log_msg("All workers are done...~n", []),
     log_msg("ibrowse_test_results table: ~n~p~n", [ets:tab2list(ibrowse_test_results)]),
@@ -114,24 +118,28 @@ spawn_workers(Url, NumWorkers, NumReqsPerWorker) ->
     ets:insert(pid_table, {Pid, []}),
     spawn_workers(Url, NumWorkers - 1, NumReqsPerWorker).
 
-do_wait() ->
+do_wait(Url) ->
     receive
 	{'EXIT', _, normal} ->
-	    do_wait();
+            catch ibrowse:show_dest_status(Url),
+            catch ibrowse:show_dest_status(),
+	    do_wait(Url);
 	{'EXIT', Pid, Reason} ->
 	    ets:delete(pid_table, Pid),
 	    ets:insert(ibrowse_errors, {Pid, Reason}),
 	    ets:update_counter(ibrowse_test_results, crash, 1),
-	    do_wait();
+	    do_wait(Url);
 	Msg ->
 	    io:format("Recvd unknown message...~p~n", [Msg]),
-	    do_wait()
+	    do_wait(Url)
     after 1000 ->
 	    case ets:info(pid_table, size) of
 		0 ->
 		    done;
 		_ ->
-		    do_wait()
+                    catch ibrowse:show_dest_status(Url),
+                    catch ibrowse:show_dest_status(),
+		    do_wait(Url)
 	    end
     end.
 
@@ -223,7 +231,9 @@ dump_errors(Key, Iod) ->
 		    {"http://www.httpwatch.com/httpgallery/chunked/", get},
                     {"https://github.com", get, [{ssl_options, [{depth, 2}]}]},
                     {local_test_fun, test_20122010, []},
-                    {local_test_fun, test_pipeline_head_timeout, []}
+                    {local_test_fun, test_pipeline_head_timeout, []},
+                    {local_test_fun, test_head_transfer_encoding, []},
+                    {local_test_fun, test_head_response_with_body, []}
 		   ]).
 
 unit_tests() ->
@@ -236,16 +246,19 @@ unit_tests(Options) ->
     (catch ibrowse_test_server:start_server(8181, tcp)),
     ibrowse:start(),
     Options_1 = Options ++ [{connect_timeout, 5000}],
+    Test_timeout = proplists:get_value(test_timeout, Options, 60000),
     {Pid, Ref} = erlang:spawn_monitor(?MODULE, unit_tests_1, [self(), Options_1]),
     receive 
 	{done, Pid} ->
 	    ok;
 	{'DOWN', Ref, _, _, Info} ->
 	    io:format("Test process crashed: ~p~n", [Info])
-    after 60000 ->
+    after Test_timeout ->
 	    exit(Pid, kill),
 	    io:format("Timed out waiting for tests to complete~n", [])
-    end.
+    end,
+    catch ibrowse_test_server:stop_server(8181),
+    ok.
 
 unit_tests_1(Parent, Options) ->
     lists:foreach(fun({local_test_fun, Fun_name, Args}) ->
@@ -429,6 +442,39 @@ log_msg(Fmt, Args) ->
     io:format("~s -- " ++ Fmt,
 	      [ibrowse_lib:printable_date() | Args]).
 
+%%------------------------------------------------------------------------------
+%% Test what happens when the response to a HEAD request is a
+%% Chunked-Encoding response with a non-empty body. Issue #67 on
+%% Github
+%% ------------------------------------------------------------------------------
+test_head_transfer_encoding() ->
+    clear_msg_q(),
+    test_head_transfer_encoding("http://localhost:8181/ibrowse_head_test").
+
+test_head_transfer_encoding(Url) ->
+    case ibrowse:send_req(Url, [], head) of
+        {ok, "200", _, _} ->
+            success;
+        Res ->
+            {test_failed, Res}
+    end.
+
+%%------------------------------------------------------------------------------
+%% Test what happens when the response to a HEAD request is a
+%% Chunked-Encoding response with a non-empty body. Issue #67 on
+%% Github
+%% ------------------------------------------------------------------------------
+test_head_response_with_body() ->
+    clear_msg_q(),
+    test_head_response_with_body("http://localhost:8181/ibrowse_head_transfer_enc").
+
+test_head_response_with_body(Url) ->
+    case ibrowse:send_req(Url, [], head, [], [{workaround, head_response_with_body}]) of
+        {ok, "400", _, _} ->
+            success;
+        Res ->
+            {test_failed, Res}
+    end.
 
 %%------------------------------------------------------------------------------
 %% Test what happens when the request at the head of a pipeline times out

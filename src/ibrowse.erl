@@ -6,7 +6,7 @@
 %%% Created : 11 Oct 2003 by Chandrashekhar Mullaparthi <chandrashekhar.mullaparthi@t-mobile.co.uk>
 %%%-------------------------------------------------------------------
 %% @author Chandrashekhar Mullaparthi <chandrashekhar dot mullaparthi at gmail dot com>
-%% @copyright 2005-2011 Chandrashekhar Mullaparthi
+%% @copyright 2005-2012 Chandrashekhar Mullaparthi
 %% @doc The ibrowse application implements an HTTP 1.1 client in erlang. This
 %% module implements the API of the HTTP client. There is one named
 %% process called 'ibrowse' which assists in load balancing and maintaining configuration. There is one load balancing process per unique webserver. There is
@@ -70,6 +70,7 @@
 -export([
          rescan_config/0,
          rescan_config/1,
+         add_config/1,
          get_config_value/1,
          get_config_value/2,
          spawn_worker_process/1,
@@ -96,7 +97,10 @@
          trace_off/2,
          all_trace_off/0,
          show_dest_status/0,
-         show_dest_status/2
+         show_dest_status/1,
+         show_dest_status/2,
+         get_metrics/0,
+         get_metrics/2
         ]).
 
 -ifdef(debug).
@@ -135,7 +139,12 @@ start() ->
 
 %% @doc Stop the ibrowse process. Useful when testing using the shell.
 stop() ->
-    catch gen_server:call(ibrowse, stop).
+    case catch gen_server:call(ibrowse, stop) of
+        {'EXIT',{noproc,_}} ->
+            ok;
+        Res ->
+            Res
+    end.
 
 %% @doc This is the basic function to send a HTTP request.
 %% The Status return value indicates the HTTP status code returned by the webserver
@@ -166,9 +175,11 @@ send_req(Url, Headers, Method) ->
 send_req(Url, Headers, Method, Body) ->
     send_req(Url, Headers, Method, Body, []).
 
-%% @doc Same as send_req/4. 
-%% For a description of SSL Options, look in the <a href="http://www.erlang.org/doc/apps/ssl/index.html">ssl</a> manpage. If the
-%% HTTP Version to use is not specified, the default is 1.1.
+%% @doc Same as send_req/4.
+
+%% For a description of SSL Options, look in the <a href="http://www.erlang.org/doc/apps/ssl/index.html">ssl</a> manpage.
+%% For a description of Process Options, look in the <a href="http://www.erlang.org/doc/man/gen_server.html">gen_server</a> manpage.
+%% If the HTTP Version to use is not specified, the default is 1.1.
 %% <br/>
 %% <ul>
 %% <li>The <code>host_header</code> option is useful in the case where ibrowse is
@@ -276,7 +287,9 @@ send_req(Url, Headers, Method, Body) ->
 %%          {transfer_encoding, {chunked, ChunkSize}} | 
 %%          {headers_as_is, boolean()}         |
 %%          {give_raw_headers, boolean()}      |
-%%          {preserve_chunked_encoding,boolean()}
+%%          {preserve_chunked_encoding,boolean()}     |
+%%          {workaround, head_response_with_body}     |
+%%          {worker_process_options, list()}
 %%
 %% stream_to() = process() | {process(), once}
 %% process() = pid() | atom()
@@ -330,10 +343,12 @@ try_routing_request(Lb_pid, Parsed_url,
                     Max_pipeline_size,
                     {SSLOptions, IsSSL}, 
                     Headers, Method, Body, Options_1, Timeout, Try_count) when Try_count < 3 ->
+    ProcessOptions = get_value(worker_process_options, Options_1, []),
     case ibrowse_lb:spawn_connection(Lb_pid, Parsed_url,
                                              Max_sessions, 
                                              Max_pipeline_size,
-                                             {SSLOptions, IsSSL}) of
+                                             {SSLOptions, IsSSL},
+                                             ProcessOptions) of
         {ok, Conn_Pid} ->
             case do_send_req(Conn_Pid, Parsed_url, Headers,
                              Method, Body, Options_1, Timeout) of
@@ -353,15 +368,16 @@ try_routing_request(_, _, _, _, _, _, _, _, _, _, _) ->
     {error, retry_later}.
 
 merge_options(Host, Port, Options) ->
-    Config_options = get_config_value({options, Host, Port}, []),
+    Config_options = get_config_value({options, Host, Port}, []) ++
+                     get_config_value({options, global}, []),
     lists:foldl(
       fun({Key, Val}, Acc) ->
-                        case lists:keysearch(Key, 1, Options) of
-                            false ->
-                                [{Key, Val} | Acc];
-                            _ ->
-                                Acc
-                        end
+              case lists:keysearch(Key, 1, Options) of
+                  false ->
+                      [{Key, Val} | Acc];
+                  _ ->
+                      Acc
+              end
       end, Options, Config_options).
 
 get_lb_pid(Url) ->
@@ -459,28 +475,32 @@ ensure_bin({Fun, _} = Body) when is_function(Fun) -> Body.
 %% request is sent via any of the send_req_direct/4,5,6,7 functions.<br/>
 %% <b>Note:</b> It is the responsibility of the calling process to control
 %% pipeline size on such connections.
-%%
-%% @spec spawn_worker_process(Url::string()) -> {ok, pid()}
-spawn_worker_process(Url) ->
-    ibrowse_http_client:start(Url).
 
-%% @doc Same as spawn_worker_process/1 but takes as input a Host and Port
-%% instead of a URL.
-%% @spec spawn_worker_process(Host::string(), Port::integer()) -> {ok, pid()}
-spawn_worker_process(Host, Port) ->
-    ibrowse_http_client:start({Host, Port}).
+%% @spec spawn_worker_process(Url::string() | {Host::string(), Port::integer()}) -> {ok, pid()}
+spawn_worker_process(Args) ->
+    spawn_worker_process(Args, []).
+
+%% @doc Same as spawn_worker_process/1 except with Erlang process options.
+%% @spec spawn_worker_process(Url::string() | {Host::string(), Port::integer(), Options::list()) -> {ok, pid()}
+spawn_worker_process(Host, Port) when is_list(Host), is_integer(Port) ->
+    %% Convert old API calls to new API format.
+    spawn_worker_process({Host, Port}, []);
+spawn_worker_process(Args, Options) ->
+    ibrowse_http_client:start(Args, Options).
 
 %% @doc Same as spawn_worker_process/1 except the the calling process
 %% is linked to the worker process which is spawned.
-%% @spec spawn_link_worker_process(Url::string()) -> {ok, pid()}
-spawn_link_worker_process(Url) ->
-    ibrowse_http_client:start_link(Url).
+%% @spec spawn_link_worker_process(Url::string() | {Host::string(), Port::integer()}) -> {ok, pid()}
+spawn_link_worker_process(Args) ->
+    spawn_link_worker_process(Args, []).
 
-%% @doc Same as spawn_worker_process/2 except the the calling process
-%% is linked to the worker process which is spawned.
-%% @spec spawn_link_worker_process(Host::string(), Port::integer()) -> {ok, pid()}
-spawn_link_worker_process(Host, Port) ->
-    ibrowse_http_client:start_link({Host, Port}).
+%% @doc Same as spawn_link_worker_process/1 except with Erlang process options.
+%% @spec spawn_link_worker_process(Url::string() | {Host::string(), Port::integer(), Options::list()) -> {ok, pid()}
+spawn_link_worker_process(Host, Port) when is_list(Host), is_integer(Port) ->
+    %% Convert old API calls to new API format.
+    spawn_link_worker_process({Host, Port}, []);
+spawn_link_worker_process(Args, Options) ->
+    ibrowse_http_client:start_link(Args, Options).
 
 %% @doc Terminate a worker process spawned using
 %% spawn_worker_process/2 or spawn_link_worker_process/2. Requests in
@@ -582,6 +602,46 @@ all_trace_off() ->
 %% about workers spawned using spawn_worker_process/2 or
 %% spawn_link_worker_process/2 is not included.
 show_dest_status() ->
+    io:format("~-40.40s | ~-5.5s | ~-10.10s | ~s~n",
+              ["Server:port", "ETS", "Num conns", "LB Pid"]),
+    io:format("~80.80.=s~n", [""]),
+    Metrics = get_metrics(),
+    lists:foreach(
+      fun({Host, Port, Lb_pid, Tid, Size}) ->
+              io:format("~40.40s | ~-5.5s | ~-5.5s | ~p~n",
+                        [Host ++ ":" ++ integer_to_list(Port),
+                         integer_to_list(Tid),
+                         integer_to_list(Size), 
+                         Lb_pid])
+      end, Metrics).
+
+show_dest_status(Url) ->                                          
+    #url{host = Host, port = Port} = ibrowse_lib:parse_url(Url),
+    show_dest_status(Host, Port).
+
+%% @doc Shows some internal information about load balancing to a
+%% specified Host:Port. Info about workers spawned using
+%% spawn_worker_process/2 or spawn_link_worker_process/2 is not
+%% included.
+show_dest_status(Host, Port) ->
+    case get_metrics(Host, Port) of
+        {Lb_pid, MsgQueueSize, Tid, Size,
+         {{First_p_sz, First_speculative_sz},
+          {Last_p_sz, Last_speculative_sz}}} ->
+            io:format("Load Balancer Pid     : ~p~n"
+                      "LB process msg q size : ~p~n"
+                      "LB ETS table id       : ~p~n"
+                      "Num Connections       : ~p~n"
+                      "Smallest pipeline     : ~p:~p~n"
+                      "Largest pipeline      : ~p:~p~n",
+                      [Lb_pid, MsgQueueSize, Tid, Size, 
+                       First_p_sz, First_speculative_sz,
+                       Last_p_sz, Last_speculative_sz]);
+        _Err ->
+            io:format("Metrics not available~n", [])
+    end.
+
+get_metrics() ->
     Dests = lists:filter(fun({lb_pid, {Host, Port}, _}) when is_list(Host),
                                                              is_integer(Port) ->
                                  true;
@@ -589,67 +649,51 @@ show_dest_status() ->
                                  false
                          end, ets:tab2list(ibrowse_lb)),
     All_ets = ets:all(),
-    io:format("~-40.40s | ~-5.5s | ~-10.10s | ~s~n",
-              ["Server:port", "ETS", "Num conns", "LB Pid"]),
-    io:format("~80.80.=s~n", [""]),
-    lists:foreach(fun({lb_pid, {Host, Port}, Lb_pid}) ->
-                          case lists:dropwhile(
-                                 fun(Tid) ->
-                                         ets:info(Tid, owner) /= Lb_pid
-                                 end, All_ets) of
-                              [] ->
-                                  io:format("~40.40s | ~-5.5s | ~-5.5s | ~s~n",
-                                            [Host ++ ":" ++ integer_to_list(Port),
-                                             "",
-                                             "",
-                                             io_lib:format("~p", [Lb_pid])]
-                                           );
-                              [Tid | _] ->
-                                  catch (
-                                    begin
-                                        Size = ets:info(Tid, size),
-                                        io:format("~40.40s | ~-5.5s | ~-5.5s | ~s~n",
-                                                  [Host ++ ":" ++ integer_to_list(Port),
-                                                   io_lib:format("~p", [Tid]),
-                                                   integer_to_list(Size),
-                                                   io_lib:format("~p", [Lb_pid])]
-                                                 )
-                                    end
-                                   )
-                                  end
-                  end, Dests).
-                                          
-%% @doc Shows some internal information about load balancing to a
-%% specified Host:Port. Info about workers spawned using
-%% spawn_worker_process/2 or spawn_link_worker_process/2 is not
-%% included.
-show_dest_status(Host, Port) ->
+    lists:map(fun({lb_pid, {Host, Port}, Lb_pid}) ->
+                  case lists:dropwhile(
+                         fun(Tid) ->
+                                 ets:info(Tid, owner) /= Lb_pid
+                         end, All_ets) of
+                      [] ->
+                          {Host, Port, Lb_pid, unknown, 0};
+                      [Tid | _] ->
+                          Size = case catch (ets:info(Tid, size)) of
+                                     N when is_integer(N) -> N;
+                                     _ -> 0
+                                 end,
+                          {Host, Port, Lb_pid, Tid, Size}
+                  end
+              end, Dests).
+
+get_metrics(Host, Port) ->
     case ets:lookup(ibrowse_lb, {Host, Port}) of
         [] ->
             no_active_processes;
         [#lb_pid{pid = Lb_pid}] ->
-            io:format("Load Balancer Pid     : ~p~n", [Lb_pid]),
-            io:format("LB process msg q size : ~p~n", [(catch process_info(Lb_pid, message_queue_len))]),
+            MsgQueueSize = (catch process_info(Lb_pid, message_queue_len)),
+            %% {Lb_pid, MsgQueueSize,
             case lists:dropwhile(
                    fun(Tid) ->
                            ets:info(Tid, owner) /= Lb_pid
                    end, ets:all()) of
                 [] ->
-                    io:format("Couldn't locate ETS table for ~p~n", [Lb_pid]);
+                    {Lb_pid, MsgQueueSize, unknown, 0, unknown};
                 [Tid | _] ->
-                    First = ets:first(Tid),
-                    Last = ets:last(Tid),
-                    Size = ets:info(Tid, size),
-                    io:format("LB ETS table id       : ~p~n", [Tid]),
-                    io:format("Num Connections       : ~p~n", [Size]),
-                    case Size of
-                        0 ->
-                            ok;
-                        _ ->
-                            {First_p_sz, _} = First,
-                            {Last_p_sz, _} = Last,
-                            io:format("Smallest pipeline     : ~1000.p~n", [First_p_sz]),
-                            io:format("Largest pipeline      : ~1000.p~n", [Last_p_sz])
+                    try
+                        Size = ets:info(Tid, size),
+                        case Size of
+                            0 ->
+                                ok;
+                            _ ->
+                                First = ets:first(Tid),
+                                Last = ets:last(Tid),
+                                [{_, First_p_sz, First_speculative_sz}] = ets:lookup(Tid, First),
+                                [{_, Last_p_sz, Last_speculative_sz}] = ets:lookup(Tid, Last),
+                                {Lb_pid, MsgQueueSize, Tid, Size,
+                                 {{First_p_sz, First_speculative_sz}, {Last_p_sz, Last_speculative_sz}}}
+                        end
+                    catch _:_ ->
+                            not_available
                     end
             end
     end.
@@ -664,8 +708,14 @@ rescan_config() ->
 %% Clear current configuration for ibrowse and load from the specified
 %% file. Current configuration is cleared only if the specified
 %% file is readable using file:consult/1
+rescan_config([{_,_}|_]=Terms) ->
+    gen_server:call(?MODULE, {rescan_config_terms, Terms});
 rescan_config(File) when is_list(File) ->
     gen_server:call(?MODULE, {rescan_config, File}).
+
+%% @doc Add additional configuration elements at runtime.
+add_config([{_,_}|_]=Terms) ->
+    gen_server:call(?MODULE, {add_config_terms, Terms}).
 
 %%====================================================================
 %% Server functions
@@ -702,44 +752,60 @@ import_config() ->
 import_config(Filename) ->
     case file:consult(Filename) of
         {ok, Terms} ->
-            ets:delete_all_objects(ibrowse_conf),
-            Fun = fun({dest, Host, Port, MaxSess, MaxPipe, Options}) 
-                     when is_list(Host), is_integer(Port),
-                          is_integer(MaxSess), MaxSess > 0,
-                          is_integer(MaxPipe), MaxPipe > 0, is_list(Options) ->
-                          I = [{{max_sessions, Host, Port}, MaxSess},
-                               {{max_pipeline_size, Host, Port}, MaxPipe},
-                               {{options, Host, Port}, Options}],
-                          lists:foreach(
-                            fun({X, Y}) ->
-                                    ets:insert(ibrowse_conf,
-                                               #ibrowse_conf{key = X, 
-                                                             value = Y})
-                            end, I);
-                     ({K, V}) ->
-                          ets:insert(ibrowse_conf,
-                                     #ibrowse_conf{key = K,
-                                                   value = V});
-                     (X) ->
-                          io:format("Skipping unrecognised term: ~p~n", [X])
-                  end,
-            lists:foreach(Fun, Terms);
+            apply_config(Terms);
         _Err ->
             ok
     end.
 
+apply_config(Terms) ->
+    ets:delete_all_objects(ibrowse_conf),
+    insert_config(Terms).
+
+insert_config(Terms) ->
+    Fun = fun({dest, Host, Port, MaxSess, MaxPipe, Options}) 
+             when is_list(Host), is_integer(Port),
+                  is_integer(MaxSess), MaxSess > 0,
+                  is_integer(MaxPipe), MaxPipe > 0, is_list(Options) ->
+                  I = [{{max_sessions, Host, Port}, MaxSess},
+                       {{max_pipeline_size, Host, Port}, MaxPipe},
+                       {{options, Host, Port}, Options}],
+                  lists:foreach(
+                    fun({X, Y}) ->
+                            ets:insert(ibrowse_conf,
+                                       #ibrowse_conf{key = X, 
+                                                     value = Y})
+                    end, I);
+             ({K, V}) ->
+                  ets:insert(ibrowse_conf,
+                             #ibrowse_conf{key = K,
+                                           value = V});
+             (X) ->
+                  io:format("Skipping unrecognised term: ~p~n", [X])
+          end,
+    lists:foreach(Fun, Terms).
+
 %% @doc Internal export
 get_config_value(Key) ->
-    [#ibrowse_conf{value = V}] = ets:lookup(ibrowse_conf, Key),
-    V.
+    try
+        [#ibrowse_conf{value = V}] = ets:lookup(ibrowse_conf, Key),
+        V
+    catch
+        error:badarg ->
+            throw({error, ibrowse_not_running})
+    end.
 
 %% @doc Internal export
 get_config_value(Key, DefVal) ->
-    case ets:lookup(ibrowse_conf, Key) of
-        [] ->
-            DefVal;
-        [#ibrowse_conf{value = V}] ->
-            V
+    try
+        case ets:lookup(ibrowse_conf, Key) of
+            [] ->
+                DefVal;
+            [#ibrowse_conf{value = V}] ->
+                V
+        end
+    catch
+        error:badarg ->
+            throw({error, ibrowse_not_running})
     end.
 
 set_config_value(Key, Val) ->
@@ -776,6 +842,14 @@ handle_call(rescan_config, _From, State) ->
 
 handle_call({rescan_config, File}, _From, State) ->
     Ret = (catch import_config(File)),
+    {reply, Ret, State};
+
+handle_call({rescan_config_terms, Terms}, _From, State) ->
+    Ret = (catch apply_config(Terms)),
+    {reply, Ret, State};
+
+handle_call({add_config_terms, Terms}, _From, State) ->
+    Ret = (catch insert_config(Terms)),
     {reply, Ret, State};
 
 handle_call(Request, _From, State) ->
